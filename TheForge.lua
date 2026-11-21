@@ -161,6 +161,24 @@ function Planner.currentWorld(islands, placeId)
     return nil, nil
 end
 
+function Planner.caveWorld(name)
+    return tonumber(name:match("^Island(%d+)") or name:match("^I(%d+)_"))
+end
+
+function Planner.rockArea(target, folder)
+    if not folder then return nil end
+    local node = target
+    while node and node.Parent ~= folder do node = node.Parent end
+    if node then return node == target and "" or node.Name end
+    return nil
+end
+
+function Planner.rockInWorld(name, area, world, rockWorlds)
+    if not world or area == nil then return false end
+    local caveWorld, knownWorlds = Planner.caveWorld(area), rockWorlds[name]
+    return (not caveWorld or caveWorld == world) and (not knownWorlds or knownWorlds[world] == true)
+end
+
 -- Kill-Ziel pruefen: normaler Mob-Name ("Brute Oni") oder Mutation ("Mutation:Hell" -> Attribut Mutation/EventMutation == "Hell").
 function Planner.killMatches(modelName, target, mutation, eventMutation)
     local wanted = type(target) == "string" and target:match("^Mutation:(.+)$")
@@ -408,15 +426,27 @@ local CharacterService = Knit.GetService("CharacterService")
 local player = Players.LocalPlayer
 local availableOres, availableMobs, availableRocks = {}, {}, {}
 local currentWorld, currentWorldName = Planner.currentWorld(Islands.Data, game.PlaceId)
-local function addRockOres(name)
-    if not Rocks[name] then return end
+Planner.rockWorlds = {}
+for areaName, cave in pairs(Caves) do
+    local world = Planner.caveWorld(areaName)
+    if world then
+        for _, spawn in ipairs(cave.Rocks or {}) do
+            Planner.rockWorlds[spawn.Name] = Planner.rockWorlds[spawn.Name] or {}
+            Planner.rockWorlds[spawn.Name][world] = true
+        end
+    end
+end
+local function addRockOres(name, area)
+    if not Rocks[name] or not Planner.rockInWorld(name, area, currentWorld, Planner.rockWorlds) then return end
     availableRocks[name] = true
     for _, ore in ipairs(Rocks[name] and Rocks[name].Ores or {}) do if Ores[ore] then availableOres[ore] = true end end
 end
 for _, folder in ipairs(workspace.Rocks:GetChildren()) do
-    for _, spawn in ipairs(Caves[folder.Name] and Caves[folder.Name].Rocks or {}) do addRockOres(spawn.Name) end
+    for _, spawn in ipairs(Caves[folder.Name] and Caves[folder.Name].Rocks or {}) do addRockOres(spawn.Name, folder.Name) end
 end
-for _, rock in ipairs(workspace.Rocks:GetDescendants()) do if rock:IsA("Model") then addRockOres(rock.Name) end end
+for _, rock in ipairs(workspace.Rocks:GetDescendants()) do
+    if rock:IsA("Model") then addRockOres(rock.Name, Planner.rockArea(rock, workspace.Rocks)) end
+end
 -- Mob-Art eines Modells ("Brute Oni13" -> "Brute Oni"); auch fuer Mobs, die nicht in Shared.Data.Enemies stehen.
 local function mobKey(model)
     return Planner.mobName(model.Name, Enemies) or (model.Name:gsub("%d+$", ""))
@@ -785,6 +815,11 @@ track(player.CharacterRemoving:Connect(function()
     if api.Enabled and api.Running and stats.startTime then stats.deaths += 1 end
     api:Stop(api.AutoRestart and api.WantRunning and "Character changed: auto restart pending" or "Character changed: enable farming again") end))
 track(RunService.PreSimulation:Connect(function(dt)
+    if api.ForgeGoal and api.ForgeGoal.isTraveling and api.ForgeGoal.isTraveling() then
+        setMobPhysics(false)
+        restoreCollisions()
+        return
+    end
     -- Physik-Modus (keine Bodenhaftung des Humanoids): beim Mob-Farmen immer, sonst waehrend jeder Flugstrecke.
     -- Vorher nur bei Mobs -> beim Flug zu Erzen/NPCs durch Boeden und Decken drueckte die Bodenhaftung den Charakter
     -- zurueck und er blieb zwischen zwei Ebenen stecken. Am Ziel (unter 2,5 Studs) wieder normaler Zustand.
@@ -839,7 +874,11 @@ track(RunService.PreSimulation:Connect(function(dt)
     if not accessible(destination.Position) then api:Stop("Area locked or blocked"); return end
     if followAttack then
         destination = attackFrame(followAttack.target, followAttack.kind)
-        if not destination then return end
+        if not destination then
+            followAttack = nil
+            if stopMiningInput then stopMiningInput() end
+            return
+        end
     end
     local delta = destination.Position - root.Position
     root.CFrame = root.CFrame:Lerp(destination, math.min(1, api.Speed * dt / math.max(delta.Magnitude, 0.001)))
@@ -1300,9 +1339,11 @@ local function eligible(target, job, power)
     if not rock or not target:GetAttribute("IsInitiated") or healthOf(target, "Mine") <= 0 then return false end
     local pickaxeName = (data().Equipped.Pickaxe or {}).Name
     if not Planner.canMine(rock, power, pickaxeName, target:GetAttribute("RequiredDamage")) then return false end
+    local rockArea = Planner.rockArea(target, workspace:FindFirstChild("Rocks"))
+    if not rockArea or not Planner.rockInWorld(target.Name, rockArea, currentWorld, Planner.rockWorlds) then return false end
     local wanted = job.kind == "Gold" or (job.kind == "SelectedOre" and Planner.rockMatches(target.Name, rock.Ores, job.selected, job.rocks))
         or (job.kind == "Mine" and target.Name == job.target) or (job.kind == "Ore" and table.find(rock.Ores or {}, job.target) ~= nil)
-        or (job.kind == "Respawn" and Planner.respawnRockMatches(job, target.Name, target.Parent and target.Parent.Parent and target.Parent.Parent.Name or ""))
+        or (job.kind == "Respawn" and Planner.respawnRockMatches(job, target.Name, rockArea))
     if not wanted or isBlocked(target) then return false end
     if Planner.forbiddenNeighbor(target, power, pickaxeName) then return false end
     local position = target:GetPivot().Position
@@ -1374,6 +1415,10 @@ local function findTarget(job)
 end
 attackFrame = function(target, kind)
     if not target or not target.Parent then return nil end
+    if kind ~= "Kill" and kind ~= "ClashMine" then
+        local area = Planner.rockArea(target, workspace:FindFirstChild("Rocks"))
+        if not Planner.rockInWorld(target.Name, area, currentWorld, Planner.rockWorlds) then return nil end
+    end
     local position = target:GetPivot().Position
     local targetRoot = target:FindFirstChild(kind == "Kill" and "HumanoidRootPart" or "Hitbox")
     if targetRoot and targetRoot:IsA("BasePart") then
@@ -1402,9 +1447,13 @@ local swingState = {attacking = false, service = Knit.GetService("ToolService")}
 local function attack(target, job, token)
     swingState.attacking = false
     if api.Defending then return end
-    followAttack = {target = target, kind = job.kind}
     destination = attackFrame(target, job.kind)
-    if not destination then return end
+    if not destination then
+        followAttack = nil
+        if stopMiningInput then stopMiningInput() end
+        return
+    end
+    followAttack = {target = target, kind = job.kind}
     -- Mobs bewegen sich staendig: bis 4 Studs Abstand trotzdem zuschlagen (vorher 1,2 -> viele Schlaege fielen aus).
     if (root.Position - destination.Position).Magnitude > (job.kind == "Kill" and 4 or 1.2) then
         if stopMiningInput then stopMiningInput() end
@@ -2693,18 +2742,24 @@ do
     ]]
     forgeGoal.resumeFile = "ForgeHelper.goal"
     local travelBlockedUntil = 0
+    function forgeGoal.isTraveling()
+        return forgeGoal.travelUntil ~= nil and os.clock() < forgeGoal.travelUntil
+    end
     function forgeGoal.travel(island, why)
         local target = Islands.Data[island]
-        if not target or island == currentWorld or os.clock() < travelBlockedUntil then return false end
+        if not target or type(target.PlaceId) ~= "number" or not currentWorld or island == currentWorld
+            or target.PlaceId == game.PlaceId or os.clock() < travelBlockedUntil then return false end
         travelBlockedUntil = os.clock() + 60
+        forgeGoal.travelUntil = travelBlockedUntil
         if stopMiningInput then stopMiningInput() end
-        destination = nil
-        log(string.format("Forge goal: traveling to %s (%s)", target.Name, why))
+        destination, followAttack, activeTarget, activeJob, lastDriven, holdFrame = nil, nil, nil, nil, nil, nil
         api:SaveSettings()
-        pcall(writefile, forgeGoal.resumeFile, tostring(os.time()))
+        pcall(writefile, forgeGoal.resumeFile, tostring(os.time()) .. "|" .. tostring(target.PlaceId))
         if type(queueonteleport) == "function" then pcall(queueonteleport, forgeGoal.loader) end
+        log(string.format("Forge goal: teleporting to %s (%s)", target.Name, why))
         local ok, result = pcall(function() return PortalService:TeleportToIsland(target.Name):await() end)
         if not ok or result == false then
+            forgeGoal.travelUntil = nil
             pcall(delfile, forgeGoal.resumeFile)
             log("Forge goal: travel to " .. target.Name .. " failed: " .. tostring(result))
             return false
@@ -3524,7 +3579,7 @@ local lastSale, lastEquip = -60, -5
 -- FARM_STEP_START
 local function step(token)
     swingState.attacking = false
-    if not api.Enabled then return end
+    if not api.Enabled or forgeGoal.isTraveling() then return end
     if not report or os.clock() - lastPlan > 12 then api:Refresh() end
     if api.Defending then return end
     if FC.ForgeActive then if stopMiningInput then stopMiningInput() end; destination = nil; log("Forge active; farming paused"); return end
@@ -5441,19 +5496,23 @@ local RESUME_FILE = "ForgeHelper.resume"
 local rejoining, teleporting = false, false
 track(player.OnTeleport:Connect(function(state)
     teleporting = state ~= Enum.TeleportState.Failed
+    if not teleporting and forgeGoal.isTraveling() then
+        forgeGoal.travelUntil = nil
+        pcall(delfile, forgeGoal.resumeFile)
+    end
 end))
 local function rejoin(reason)
-    if reason == "DisconnectClientInitiated" or rejoining or teleporting or destroyed or not api.AutoRejoin then return end
+    if reason == "DisconnectClientInitiated" or rejoining or teleporting or forgeGoal.isTraveling() or destroyed or not api.AutoRejoin then return end
     rejoining = true
     task.spawn(function()
         task.wait(3)
-        if teleporting or destroyed or not api.AutoRejoin then rejoining = false; return end
+        if teleporting or forgeGoal.isTraveling() or destroyed or not api.AutoRejoin then rejoining = false; return end
         warn("[ForgeHelper] Auto-Rejoin: " .. tostring(reason))
         pcall(writefile, RESUME_FILE, os.time() .. "|" .. tostring(api.WantRunning == true))
         if type(queueonteleport) == "function" then pcall(queueonteleport, forgeGoal.loader) end
         for attempt = 1, 30 do
             if destroyed or not api.AutoRejoin then break end
-            if not teleporting then pcall(function() TeleportService:Teleport(game.PlaceId, player) end) end
+            if not teleporting and not forgeGoal.isTraveling() then pcall(function() TeleportService:Teleport(game.PlaceId, player) end) end
             if attempt < 30 then task.wait(10) end
         end
         rejoining = false
@@ -5488,9 +5547,13 @@ if type(isfile) == "function" and isfile(RESUME_FILE) then
 end
 -- Nach einer Reise fuers Schmiede-Ziel (hoechstens 15 Minuten her): Ziel und Farmen fortsetzen
 if type(isfile) == "function" and isfile(forgeGoal.resumeFile) then
-    local stamp = tonumber(readfile(forgeGoal.resumeFile))
-    pcall(delfile, forgeGoal.resumeFile)
-    if stamp and os.time() - stamp < 900 then
+    local content = readfile(forgeGoal.resumeFile)
+    local time, place = content:match("^(%d+)|(%d+)$")
+    local stamp = tonumber(time or content)
+    if not stamp or os.time() - stamp >= 900 then
+        pcall(delfile, forgeGoal.resumeFile)
+    elseif not place or tonumber(place) == game.PlaceId then
+        pcall(delfile, forgeGoal.resumeFile)
         api.FarmMode, api.ForgeGoalActive = "Forging", true
         pcall(function()
             if type(setIdentity) == "function" then setIdentity(8) end
