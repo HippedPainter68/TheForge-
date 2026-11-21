@@ -1,0 +1,1 @@
+-- Copyright (c) 2026 HippedPainter68. All rights reserved.
